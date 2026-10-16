@@ -280,3 +280,22 @@ test("provider aggregation keeps providers separate and leaves connection aggreg
     ]
   );
 });
+
+test("connection aggregation carries each account's unchanged windows forward", () => {
+  // Account B: weekly 82 recorded once, then only the session window changes.
+  insertSnapshotRow("claude", "conn-b", "weekly (7d)", 82, 0, "2026-01-01T10:00:00.000Z");
+  insertSnapshotRow("claude", "conn-b", "session (5h)", 96, 0, "2026-01-01T10:05:00.000Z");
+  insertSnapshotRow("claude", "conn-b", "session (5h)", 95, 0, "2026-01-01T11:05:00.000Z");
+
+  const rows = quotaSnapshotsDb.getAggregatedSnapshots({
+    since: "2026-01-01T11:00:00.000Z",
+    bucketMinutes: 60,
+    aggregateBy: "connection",
+  });
+
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].provider, "claude:conn-b");
+  assert.equal(rows[0].remainingPct, 82);
+  assert.equal(rows[0].windowKey, "weekly (7d)");
+  assert.equal(rows[0].isExhausted, false);
+});

@@ -198,7 +198,8 @@ export function getLatestQuotaSnapshotsForConnection(connectionId: string): Quot
  * tightest window first; the point then takes the highest of those and is exhausted only
  * when every account is. Snapshots are persisted only when a value changes, so a bucket
  * with no row for an account means "unchanged", not "unknown": the account's last known
- * value is carried into the bucket (seeded from the last row before `since`).
+ * value is carried into the bucket (seeded from the last row before `since`). The
+ * per-connection view uses the same per-account reduction, so both views agree.
  */
 export function getAggregatedSnapshots(opts: {
   provider?: string;
@@ -228,38 +229,8 @@ export function getAggregatedSnapshots(opts: {
 
   const bucketExpr = `datetime((strftime('%s', created_at) / ${bucketSeconds}) * ${bucketSeconds}, 'unixepoch')`;
 
-  const connectionSql = `
-      WITH per_window AS (
-        SELECT
-          ${bucketExpr} as bucket,
-          provider || ':' || connection_id as provider,
-          AVG(remaining_percentage) as remainingPct,
-          MAX(is_exhausted) as isExhausted,
-          window_key
-        FROM quota_snapshots
-        WHERE ${conditions.join(" AND ")}
-        GROUP BY bucket, provider, connection_id, window_key
-      )
-      SELECT bucket, provider, remainingPct, isExhausted, window_key AS windowKey
-      FROM (
-        SELECT
-          bucket,
-          provider,
-          remainingPct,
-          MAX(isExhausted) OVER (PARTITION BY bucket, provider) AS isExhausted,
-          window_key,
-          ROW_NUMBER() OVER (
-            PARTITION BY bucket, provider
-            ORDER BY remainingPct IS NULL, remainingPct ASC, window_key ASC
-          ) AS rn
-        FROM per_window
-      )
-      WHERE rn = 1
-      ORDER BY bucket ASC
-    `;
-
   const seedProviderFilter = opts.provider ? "AND provider = ?" : "";
-  const providerSql = `
+  const perConnectionCtes = `
       WITH in_range AS (
         SELECT
           ${bucketExpr} as bucket,
@@ -312,6 +283,17 @@ export function getAggregatedSnapshots(opts: {
         FROM carried
         WHERE rn = 1
       )
+    `;
+
+  const connectionSql = `${perConnectionCtes}
+      SELECT bucket, provider || ':' || connection_id AS provider, remainingPct, isExhausted,
+             window_key AS windowKey
+      FROM per_connection
+      WHERE rn = 1
+      ORDER BY bucket ASC
+    `;
+
+  const providerSql = `${perConnectionCtes}
       SELECT bucket, provider, remainingPct, isExhausted, window_key AS windowKey
       FROM (
         SELECT
@@ -330,13 +312,13 @@ export function getAggregatedSnapshots(opts: {
 
   // The seed only needs the range start and the provider filter: rows after `until` never
   // contribute to a bucket anyway, and rows before `since` are reduced to one per window.
-  const providerParams = [...params, opts.since, ...(opts.provider ? [opts.provider] : [])];
+  const seedParams = [...params, opts.since, ...(opts.provider ? [opts.provider] : [])];
 
   try {
     const aggregateByConnection = opts.aggregateBy === "connection";
     const rows = db
       .prepare(aggregateByConnection ? connectionSql : providerSql)
-      .all(...(aggregateByConnection ? params : providerParams)) as Array<{
+      .all(...seedParams) as Array<{
       bucket: string;
       provider: string;
       remainingPct: number | null;
