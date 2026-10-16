@@ -177,3 +177,106 @@ test("quotaSnapshots aggregation returns one row per bucket with the tightest wi
   assert.equal(byConnection[0].provider, "claude:conn-1");
   assert.equal(byConnection[0].remainingPct, 10);
 });
+
+function insertSnapshotRow(
+  provider: string,
+  connectionId: string,
+  windowKey: string,
+  remaining: number,
+  exhausted: number,
+  createdAt: string
+) {
+  coreDb
+    .getDbInstance()
+    .prepare(
+      `INSERT INTO quota_snapshots
+       (provider, connection_id, window_key, remaining_percentage, is_exhausted, next_reset_at, window_duration_ms, raw_data, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(provider, connectionId, windowKey, remaining, exhausted, null, null, "{}", createdAt);
+}
+
+test("provider aggregation is not exhausted while another account of the provider has headroom", () => {
+  // Account A is spent (weekly window at 0) and re-snapshots in every bucket. Account B is healthy but
+  // snapshots are only persisted when a value changes, so B has a row in the first bucket only.
+  insertSnapshotRow("claude", "conn-a", "weekly (7d)", 0, 1, "2026-01-01T10:05:00.000Z");
+  insertSnapshotRow("claude", "conn-b", "session (5h)", 96, 0, "2026-01-01T10:10:00.000Z");
+  insertSnapshotRow("claude", "conn-b", "weekly (7d)", 100, 0, "2026-01-01T10:10:00.000Z");
+  insertSnapshotRow("claude", "conn-a", "weekly (7d)", 0, 1, "2026-01-01T11:05:00.000Z");
+  insertSnapshotRow("claude", "conn-a", "weekly (7d)", 0, 1, "2026-01-01T12:05:00.000Z");
+
+  const points = quotaSnapshotsDb.getAggregatedSnapshots({
+    since: "2000-01-01T00:00:00.000Z",
+    bucketMinutes: 60,
+  });
+
+  assert.deepEqual(
+    points.map((point) => point.timestamp),
+    ["2026-01-01 10:00:00", "2026-01-01 11:00:00", "2026-01-01 12:00:00"]
+  );
+  for (const point of points) {
+    assert.equal(point.isExhausted, false, `${point.timestamp}: the healthy account keeps it usable`);
+    assert.equal(point.remainingPct, 96, `${point.timestamp}: tightest window of the best account`);
+    assert.equal(point.windowKey, "session (5h)");
+  }
+});
+
+test("provider aggregation is exhausted only when every account of the provider is", () => {
+  insertSnapshotRow("claude", "conn-a", "weekly (7d)", 0, 1, "2026-01-01T10:05:00.000Z");
+  insertSnapshotRow("claude", "conn-b", "session (5h)", 0, 1, "2026-01-01T10:10:00.000Z");
+  insertSnapshotRow("claude", "conn-b", "weekly (7d)", 40, 0, "2026-01-01T10:10:00.000Z");
+
+  const [point] = quotaSnapshotsDb.getAggregatedSnapshots({
+    since: "2000-01-01T00:00:00.000Z",
+    bucketMinutes: 60,
+  });
+
+  assert.equal(point.isExhausted, true);
+  assert.equal(point.remainingPct, 0);
+});
+
+test("provider aggregation carries an unchanged account in from before the requested range", () => {
+  // B was last observed two days before the range starts and has not changed since.
+  insertSnapshotRow("claude", "conn-b", "weekly (7d)", 88, 0, "2025-12-30T08:00:00.000Z");
+  insertSnapshotRow("claude", "conn-a", "weekly (7d)", 0, 1, "2026-01-01T10:05:00.000Z");
+
+  const [point] = quotaSnapshotsDb.getAggregatedSnapshots({
+    since: "2026-01-01T00:00:00.000Z",
+    bucketMinutes: 60,
+  });
+
+  assert.equal(point.isExhausted, false);
+  assert.equal(point.remainingPct, 88);
+});
+
+test("provider aggregation keeps providers separate and leaves connection aggregation untouched", () => {
+  insertSnapshotRow("claude", "conn-a", "weekly (7d)", 0, 1, "2026-01-01T10:05:00.000Z");
+  insertSnapshotRow("claude", "conn-b", "weekly (7d)", 70, 0, "2026-01-01T10:10:00.000Z");
+  insertSnapshotRow("codex", "conn-c", "weekly (7d)", 10, 0, "2026-01-01T10:15:00.000Z");
+
+  const byProvider = quotaSnapshotsDb.getAggregatedSnapshots({
+    since: "2000-01-01T00:00:00.000Z",
+    bucketMinutes: 60,
+  });
+  assert.deepEqual(
+    byProvider.map((point) => [point.provider, point.remainingPct, point.isExhausted]),
+    [
+      ["claude", 70, false],
+      ["codex", 10, false],
+    ]
+  );
+
+  const byConnection = quotaSnapshotsDb.getAggregatedSnapshots({
+    since: "2000-01-01T00:00:00.000Z",
+    bucketMinutes: 60,
+    aggregateBy: "connection",
+  });
+  assert.deepEqual(
+    byConnection.map((point) => [point.provider, point.remainingPct, point.isExhausted]),
+    [
+      ["claude:conn-a", 0, true],
+      ["claude:conn-b", 70, false],
+      ["codex:conn-c", 10, false],
+    ]
+  );
+});

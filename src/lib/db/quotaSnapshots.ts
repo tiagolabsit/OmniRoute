@@ -192,6 +192,13 @@ export function getLatestQuotaSnapshotsForConnection(connectionId: string): Quot
  * window is. Returning one row per window made consumers pick an arbitrary one, so a
  * provider whose weekly window was exhausted could be drawn from its half-empty session
  * window instead. Samples of the same window inside a bucket are still averaged first.
+ *
+ * Provider aggregation with several accounts: an account is a fallback for the others, so
+ * the provider is as usable as its BEST account. Each account is reduced to its own
+ * tightest window first; the point then takes the highest of those and is exhausted only
+ * when every account is. Snapshots are persisted only when a value changes, so a bucket
+ * with no row for an account means "unchanged", not "unknown": the account's last known
+ * value is carried into the bucket (seeded from the last row before `since`).
  */
 export function getAggregatedSnapshots(opts: {
   provider?: string;
@@ -219,25 +226,19 @@ export function getAggregatedSnapshots(opts: {
     throw new Error("Invalid bucket size");
   }
 
-  const groupFields =
-    opts.aggregateBy === "connection"
-      ? "bucket, provider, connection_id, window_key"
-      : "bucket, provider, window_key";
-  const selectKey =
-    opts.aggregateBy === "connection" ? "provider || ':' || connection_id as provider" : "provider";
+  const bucketExpr = `datetime((strftime('%s', created_at) / ${bucketSeconds}) * ${bucketSeconds}, 'unixepoch')`;
 
-  try {
-    const sql = `
+  const connectionSql = `
       WITH per_window AS (
         SELECT
-          datetime((strftime('%s', created_at) / ${bucketSeconds}) * ${bucketSeconds}, 'unixepoch') as bucket,
-          ${selectKey},
+          ${bucketExpr} as bucket,
+          provider || ':' || connection_id as provider,
           AVG(remaining_percentage) as remainingPct,
           MAX(is_exhausted) as isExhausted,
           window_key
         FROM quota_snapshots
         WHERE ${conditions.join(" AND ")}
-        GROUP BY ${groupFields}
+        GROUP BY bucket, provider, connection_id, window_key
       )
       SELECT bucket, provider, remainingPct, isExhausted, window_key AS windowKey
       FROM (
@@ -257,7 +258,85 @@ export function getAggregatedSnapshots(opts: {
       ORDER BY bucket ASC
     `;
 
-    const rows = db.prepare(sql).all(...params) as Array<{
+  const seedProviderFilter = opts.provider ? "AND provider = ?" : "";
+  const providerSql = `
+      WITH in_range AS (
+        SELECT
+          ${bucketExpr} as bucket,
+          provider,
+          connection_id,
+          window_key,
+          AVG(remaining_percentage) as remainingPct,
+          MAX(is_exhausted) as isExhausted
+        FROM quota_snapshots
+        WHERE ${conditions.join(" AND ")}
+        GROUP BY bucket, provider, connection_id, window_key
+      ),
+      seed AS (
+        SELECT '0000-00-00 00:00:00' AS bucket, provider, connection_id, window_key,
+               remaining_percentage AS remainingPct, is_exhausted AS isExhausted
+        FROM (
+          SELECT provider, connection_id, window_key, remaining_percentage, is_exhausted,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY provider, connection_id, window_key ORDER BY created_at DESC
+                 ) AS rn
+          FROM quota_snapshots
+          WHERE created_at < ? ${seedProviderFilter}
+        )
+        WHERE rn = 1
+      ),
+      observations AS (
+        SELECT * FROM in_range
+        UNION ALL
+        SELECT * FROM seed
+      ),
+      buckets AS (SELECT DISTINCT bucket, provider FROM in_range),
+      carried AS (
+        SELECT
+          b.bucket, b.provider, o.connection_id, o.window_key, o.remainingPct, o.isExhausted,
+          ROW_NUMBER() OVER (
+            PARTITION BY b.bucket, b.provider, o.connection_id, o.window_key
+            ORDER BY o.bucket DESC
+          ) AS rn
+        FROM buckets b
+        JOIN observations o ON o.provider = b.provider AND o.bucket <= b.bucket
+      ),
+      per_connection AS (
+        SELECT
+          bucket, provider, connection_id, remainingPct, window_key,
+          MAX(isExhausted) OVER (PARTITION BY bucket, provider, connection_id) AS isExhausted,
+          ROW_NUMBER() OVER (
+            PARTITION BY bucket, provider, connection_id
+            ORDER BY remainingPct IS NULL, remainingPct ASC, window_key ASC
+          ) AS rn
+        FROM carried
+        WHERE rn = 1
+      )
+      SELECT bucket, provider, remainingPct, isExhausted, window_key AS windowKey
+      FROM (
+        SELECT
+          bucket, provider, remainingPct, window_key,
+          MIN(isExhausted) OVER (PARTITION BY bucket, provider) AS isExhausted,
+          ROW_NUMBER() OVER (
+            PARTITION BY bucket, provider
+            ORDER BY remainingPct IS NULL, remainingPct DESC, connection_id ASC
+          ) AS rn
+        FROM per_connection
+        WHERE rn = 1
+      )
+      WHERE rn = 1
+      ORDER BY bucket ASC
+    `;
+
+  // The seed only needs the range start and the provider filter: rows after `until` never
+  // contribute to a bucket anyway, and rows before `since` are reduced to one per window.
+  const providerParams = [...params, opts.since, ...(opts.provider ? [opts.provider] : [])];
+
+  try {
+    const aggregateByConnection = opts.aggregateBy === "connection";
+    const rows = db
+      .prepare(aggregateByConnection ? connectionSql : providerSql)
+      .all(...(aggregateByConnection ? params : providerParams)) as Array<{
       bucket: string;
       provider: string;
       remainingPct: number | null;
