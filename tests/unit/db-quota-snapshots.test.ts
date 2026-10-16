@@ -132,7 +132,7 @@ test("quotaSnapshots cleanup removes old rows and throttles repeated execution",
   assert.equal(throttled, 0);
 });
 
-test("quotaSnapshots aggregation returns one row per bucket with the tightest window", () => {
+test("quotaSnapshots aggregation returns one row per bucket and zeroes once the weekly window is gone", () => {
   const db = coreDb.getDbInstance();
   const insert = db.prepare(
     `INSERT INTO quota_snapshots
@@ -146,7 +146,7 @@ test("quotaSnapshots aggregation returns one row per bucket with the tightest wi
   row("session (5h)", 97, 0, "2026-01-01T10:05:00.000Z");
   row("weekly (7d)", 20, 0, "2026-01-01T10:10:00.000Z");
   row("weekly (7d)", 0, 1, "2026-01-01T10:40:00.000Z");
-  // 11:00 bucket: both windows have headroom, the weekly one is still the tightest.
+  // 11:00 bucket: the weekly window still has quota, so the session window decides.
   row("session (5h)", 90, 0, "2026-01-01T11:05:00.000Z");
   row("weekly (7d)", 40, 0, "2026-01-01T11:10:00.000Z");
 
@@ -160,13 +160,14 @@ test("quotaSnapshots aggregation returns one row per bucket with the tightest wi
     byProvider.map((point) => point.timestamp),
     ["2026-01-01 10:00:00", "2026-01-01 11:00:00"]
   );
-  // Window samples are still averaged inside a bucket (weekly: (20 + 0) / 2 = 10), then the tightest wins.
-  assert.equal(byProvider[0].remainingPct, 10);
+  // 10:00: the weekly window ran out (flagged exhausted), so the account is at 0 despite its 97% session.
+  assert.equal(byProvider[0].remainingPct, 0);
   assert.equal(byProvider[0].isExhausted, true);
   assert.equal(byProvider[0].windowKey, "weekly (7d)");
-  assert.equal(byProvider[1].remainingPct, 40);
+  // 11:00: weekly 40% remains, so the session window (90%) is what is available.
+  assert.equal(byProvider[1].remainingPct, 90);
   assert.equal(byProvider[1].isExhausted, false);
-  assert.equal(byProvider[1].windowKey, "weekly (7d)");
+  assert.equal(byProvider[1].windowKey, "session (5h)");
 
   const byConnection = quotaSnapshotsDb.getAggregatedSnapshots({
     since: "2000-01-01T00:00:00.000Z",
@@ -175,7 +176,7 @@ test("quotaSnapshots aggregation returns one row per bucket with the tightest wi
   });
   assert.equal(byConnection.length, 2);
   assert.equal(byConnection[0].provider, "claude:conn-1");
-  assert.equal(byConnection[0].remainingPct, 10);
+  assert.equal(byConnection[0].remainingPct, 0);
 });
 
 function insertSnapshotRow(
@@ -281,7 +282,7 @@ test("provider aggregation keeps providers separate and leaves connection aggreg
   );
 });
 
-test("connection aggregation carries each account's unchanged windows forward", () => {
+test("connection aggregation carries a stale weekly window forward but follows the session", () => {
   // Account B: weekly 82 recorded once, then only the session window changes.
   insertSnapshotRow("claude", "conn-b", "weekly (7d)", 82, 0, "2026-01-01T10:00:00.000Z");
   insertSnapshotRow("claude", "conn-b", "session (5h)", 96, 0, "2026-01-01T10:05:00.000Z");
@@ -295,7 +296,49 @@ test("connection aggregation carries each account's unchanged windows forward", 
 
   assert.equal(rows.length, 1);
   assert.equal(rows[0].provider, "claude:conn-b");
-  assert.equal(rows[0].remainingPct, 82);
-  assert.equal(rows[0].windowKey, "weekly (7d)");
+  assert.equal(rows[0].remainingPct, 95);
+  assert.equal(rows[0].windowKey, "session (5h)");
   assert.equal(rows[0].isExhausted, false);
+});
+
+test("a provider follows its best account and the session window while weekly quota remains", () => {
+  // A: session 40, weekly 90. B: session 75, weekly 20. C: session 100 but its weekly window is gone.
+  insertSnapshotRow("claude", "conn-a", "session (5h)", 40, 0, "2026-01-01T10:05:00.000Z");
+  insertSnapshotRow("claude", "conn-a", "weekly (7d)", 90, 0, "2026-01-01T10:05:00.000Z");
+  insertSnapshotRow("claude", "conn-b", "session (5h)", 75, 0, "2026-01-01T10:06:00.000Z");
+  insertSnapshotRow("claude", "conn-b", "weekly (7d)", 20, 0, "2026-01-01T10:06:00.000Z");
+  insertSnapshotRow("claude", "conn-c", "session (5h)", 100, 0, "2026-01-01T10:07:00.000Z");
+  insertSnapshotRow("claude", "conn-c", "weekly (7d)", 0, 1, "2026-01-01T10:07:00.000Z");
+
+  const [point] = quotaSnapshotsDb.getAggregatedSnapshots({
+    since: "2000-01-01T00:00:00.000Z",
+    bucketMinutes: 60,
+  });
+
+  assert.equal(point.remainingPct, 75, "B's session beats A's; C is spent despite a full session");
+  assert.equal(point.isExhausted, false);
+  assert.equal(point.windowKey, "session (5h)");
+});
+
+test("providers without weekly windows follow the most available window; every provider reaches the last bucket", () => {
+  // Per-model pools (agy style): one empty pool must not drag the provider to 0.
+  insertSnapshotRow("agy", "conn-x", "gemini-3-flash", 0, 0, "2026-01-01T10:05:00.000Z");
+  insertSnapshotRow("agy", "conn-x", "gemini-pro", 60, 0, "2026-01-01T10:05:00.000Z");
+  // claude keeps being sampled for three more hours, agy stays unchanged.
+  insertSnapshotRow("claude", "conn-a", "session (5h)", 50, 0, "2026-01-01T10:05:00.000Z");
+  insertSnapshotRow("claude", "conn-a", "session (5h)", 45, 0, "2026-01-01T12:05:00.000Z");
+
+  const points = quotaSnapshotsDb.getAggregatedSnapshots({
+    since: "2000-01-01T00:00:00.000Z",
+    bucketMinutes: 60,
+  });
+  const agy = points.filter((point) => point.provider === "agy");
+
+  assert.deepEqual(
+    agy.map((point) => point.timestamp),
+    ["2026-01-01 10:00:00", "2026-01-01 12:00:00"],
+    "agy is carried to the last bucket of the range"
+  );
+  assert.equal(agy[1].remainingPct, 60);
+  assert.equal(agy[1].windowKey, "gemini-pro");
 });

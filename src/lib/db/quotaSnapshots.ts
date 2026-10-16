@@ -186,20 +186,21 @@ export function getLatestQuotaSnapshotsForConnection(connectionId: string): Quot
 /**
  * Utilization series for the dashboard: ONE point per (bucket, provider-or-connection).
  *
- * A provider can report several quota windows at once (a 5h session plus a weekly
- * window, per-model pools, ...). The point therefore carries the TIGHTEST window of the
- * bucket (lowest remaining percentage, `windowKey` names it) and is exhausted when ANY
- * window is. Returning one row per window made consumers pick an arbitrary one, so a
- * provider whose weekly window was exhausted could be drawn from its half-empty session
- * window instead. Samples of the same window inside a bucket are still averaged first.
+ * The point answers "how much can I still use?", so it follows the MOST available quota:
  *
- * Provider aggregation with several accounts: an account is a fallback for the others, so
- * the provider is as usable as its BEST account. Each account is reduced to its own
- * tightest window first; the point then takes the highest of those and is exhausted only
- * when every account is. Snapshots are persisted only when a value changes, so a bucket
- * with no row for an account means "unchanged", not "unknown": the account's last known
- * value is carried into the bucket (seeded from the last row before `since`). The
- * per-connection view uses the same per-account reduction, so both views agree.
+ * - Per account, the session-like window decides (a 5h session, a per-model pool, ...; when
+ *   several exist the highest wins). It only counts while the weekly window still has quota:
+ *   as soon as a `weekly*` window is exhausted the account drops to 0 and is exhausted.
+ *   An account that reports only weekly windows is drawn from its tightest weekly window.
+ * - Per provider, the best account wins (an account is a fallback for the others), and the
+ *   provider is exhausted only when every account is.
+ *
+ * Snapshots are persisted only when a value changes, so a bucket with no row for an account
+ * means "unchanged", not "unknown": the account's last known value is carried into the bucket
+ * (seeded from the last row before `since`) and every provider is carried to the last bucket
+ * of the range. Samples of the same window inside a bucket are averaged first. The
+ * per-connection view uses the same per-account reduction, so both views agree. `windowKey`
+ * names the window the value was taken from.
  */
 export function getAggregatedSnapshots(opts: {
   provider?: string;
@@ -261,7 +262,11 @@ export function getAggregatedSnapshots(opts: {
         UNION ALL
         SELECT * FROM seed
       ),
-      buckets AS (SELECT DISTINCT bucket, provider FROM in_range),
+      buckets AS (
+        SELECT t.bucket, p.provider
+        FROM (SELECT DISTINCT bucket FROM in_range) t
+        CROSS JOIN (SELECT DISTINCT provider FROM in_range) p
+      ),
       carried AS (
         SELECT
           b.bucket, b.provider, o.connection_id, o.window_key, o.remainingPct, o.isExhausted,
@@ -272,16 +277,41 @@ export function getAggregatedSnapshots(opts: {
         FROM buckets b
         JOIN observations o ON o.provider = b.provider AND o.bucket <= b.bucket
       ),
-      per_connection AS (
-        SELECT
-          bucket, provider, connection_id, remainingPct, window_key,
-          MAX(isExhausted) OVER (PARTITION BY bucket, provider, connection_id) AS isExhausted,
-          ROW_NUMBER() OVER (
-            PARTITION BY bucket, provider, connection_id
-            ORDER BY remainingPct IS NULL, remainingPct ASC, window_key ASC
-          ) AS rn
+      flagged AS (
+        SELECT bucket, provider, connection_id, window_key, remainingPct, isExhausted,
+               (window_key LIKE 'weekly%') AS isWeekly
         FROM carried
         WHERE rn = 1
+      ),
+      gated AS (
+        SELECT *,
+          MAX(isWeekly = 1 AND (isExhausted = 1 OR remainingPct <= 0))
+            OVER (PARTITION BY bucket, provider, connection_id) AS weeklyDown,
+          MAX(isWeekly = 0) OVER (PARTITION BY bucket, provider, connection_id) AS hasSession
+        FROM flagged
+      ),
+      ranked AS (
+        SELECT *,
+          ROW_NUMBER() OVER (
+            PARTITION BY bucket, provider, connection_id
+            ORDER BY
+              CASE
+                WHEN weeklyDown = 1 THEN (CASE WHEN isWeekly = 1 AND (isExhausted = 1 OR remainingPct <= 0) THEN 0 ELSE 1 END)
+                WHEN hasSession = 1 THEN isWeekly
+                ELSE 0
+              END ASC,
+              remainingPct IS NULL,
+              CASE WHEN weeklyDown = 1 OR hasSession = 0 THEN remainingPct ELSE -remainingPct END ASC,
+              window_key ASC
+          ) AS pick
+        FROM gated
+      ),
+      per_connection AS (
+        SELECT bucket, provider, connection_id, window_key,
+               CASE WHEN weeklyDown = 1 THEN 0 ELSE remainingPct END AS remainingPct,
+               CASE WHEN weeklyDown = 1 THEN 1 ELSE isExhausted END AS isExhausted
+        FROM ranked
+        WHERE pick = 1
       )
     `;
 
@@ -289,7 +319,6 @@ export function getAggregatedSnapshots(opts: {
       SELECT bucket, provider || ':' || connection_id AS provider, remainingPct, isExhausted,
              window_key AS windowKey
       FROM per_connection
-      WHERE rn = 1
       ORDER BY bucket ASC
     `;
 
@@ -304,7 +333,6 @@ export function getAggregatedSnapshots(opts: {
             ORDER BY remainingPct IS NULL, remainingPct DESC, connection_id ASC
           ) AS rn
         FROM per_connection
-        WHERE rn = 1
       )
       WHERE rn = 1
       ORDER BY bucket ASC
