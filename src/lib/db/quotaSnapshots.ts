@@ -228,7 +228,9 @@ export function getAggregatedSnapshots(opts: {
     throw new Error("Invalid bucket size");
   }
 
-  const bucketExpr = `datetime((strftime('%s', created_at) / ${bucketSeconds}) * ${bucketSeconds}, 'unixepoch')`;
+  // ISO-8601 with an explicit `Z`: `created_at` is UTC, and a bare `YYYY-MM-DD HH:MM:SS` is parsed
+  // by browsers as LOCAL time, which shifted every chart label by the viewer's UTC offset.
+  const bucketExpr = `strftime('%Y-%m-%dT%H:%M:%SZ', (strftime('%s', created_at) / ${bucketSeconds}) * ${bucketSeconds}, 'unixepoch')`;
 
   const seedProviderFilter = opts.provider ? "AND provider = ?" : "";
   const perConnectionCtes = `

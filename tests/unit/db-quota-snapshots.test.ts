@@ -158,7 +158,7 @@ test("quotaSnapshots aggregation returns one row per bucket and zeroes once the 
   assert.equal(byProvider.length, 2, "one row per bucket, not one per quota window");
   assert.deepEqual(
     byProvider.map((point) => point.timestamp),
-    ["2026-01-01 10:00:00", "2026-01-01 11:00:00"]
+    ["2026-01-01T10:00:00Z", "2026-01-01T11:00:00Z"]
   );
   // 10:00: the weekly window ran out (flagged exhausted), so the account is at 0 despite its 97% session.
   assert.equal(byProvider[0].remainingPct, 0);
@@ -213,7 +213,7 @@ test("provider aggregation is not exhausted while another account of the provide
 
   assert.deepEqual(
     points.map((point) => point.timestamp),
-    ["2026-01-01 10:00:00", "2026-01-01 11:00:00", "2026-01-01 12:00:00"]
+    ["2026-01-01T10:00:00Z", "2026-01-01T11:00:00Z", "2026-01-01T12:00:00Z"]
   );
   for (const point of points) {
     assert.equal(point.isExhausted, false, `${point.timestamp}: the healthy account keeps it usable`);
@@ -336,7 +336,7 @@ test("providers without weekly windows follow the most available window; every p
 
   assert.deepEqual(
     agy.map((point) => point.timestamp),
-    ["2026-01-01 10:00:00", "2026-01-01 12:00:00"],
+    ["2026-01-01T10:00:00Z", "2026-01-01T12:00:00Z"],
     "agy is carried to the last bucket of the range"
   );
   assert.equal(agy[1].remainingPct, 60);
