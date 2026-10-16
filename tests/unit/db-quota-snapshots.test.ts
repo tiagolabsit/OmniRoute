@@ -342,3 +342,17 @@ test("providers without weekly windows follow the most available window; every p
   assert.equal(agy[1].remainingPct, 60);
   assert.equal(agy[1].windowKey, "gemini-pro");
 });
+
+test("a prefixed weekly window (gemini_weekly) also zeroes the account when exhausted", () => {
+  insertSnapshotRow("agy", "conn-x", "gemini-3-flash", 100, 0, "2026-01-01T10:05:00.000Z");
+  insertSnapshotRow("agy", "conn-x", "gemini_weekly", 0, 1, "2026-01-01T10:05:00.000Z");
+
+  const [point] = quotaSnapshotsDb.getAggregatedSnapshots({
+    since: "2000-01-01T00:00:00.000Z",
+    bucketMinutes: 60,
+  });
+
+  assert.equal(point.remainingPct, 0);
+  assert.equal(point.isExhausted, true);
+  assert.equal(point.windowKey, "gemini_weekly");
+});

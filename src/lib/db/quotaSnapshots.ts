@@ -190,7 +190,7 @@ export function getLatestQuotaSnapshotsForConnection(connectionId: string): Quot
  *
  * - Per account, the session-like window decides (a 5h session, a per-model pool, ...; when
  *   several exist the highest wins). It only counts while the weekly window still has quota:
- *   as soon as a `weekly*` window is exhausted the account drops to 0 and is exhausted.
+ *   as soon as a `*weekly*` window is exhausted the account drops to 0 and is exhausted.
  *   An account that reports only weekly windows is drawn from its tightest weekly window.
  * - Per provider, the best account wins (an account is a fallback for the others), and the
  *   provider is exhausted only when every account is.
@@ -279,7 +279,7 @@ export function getAggregatedSnapshots(opts: {
       ),
       flagged AS (
         SELECT bucket, provider, connection_id, window_key, remainingPct, isExhausted,
-               (window_key LIKE 'weekly%') AS isWeekly
+               (window_key LIKE '%weekly%') AS isWeekly
         FROM carried
         WHERE rn = 1
       ),
